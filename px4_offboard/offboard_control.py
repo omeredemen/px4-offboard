@@ -35,12 +35,15 @@
 __author__ = "Jaeyoung Lim"
 __contact__ = "jalim@ethz.ch"
 
+import time
+
 import rclpy
 import numpy as np
 from rclpy.node import Node
 from rclpy.clock import Clock
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
+from px4_msgs.msg import VehicleCommand
 from px4_msgs.msg import OffboardControlMode
 from px4_msgs.msg import TrajectorySetpoint
 from px4_msgs.msg import VehicleStatus
@@ -51,9 +54,9 @@ class OffboardControl(Node):
     def __init__(self):
         super().__init__('minimal_publisher')
         qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
-            durability=QoSDurabilityPolicy.RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL,
-            history=QoSHistoryPolicy.RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
 
@@ -62,13 +65,14 @@ class OffboardControl(Node):
             '/fmu/out/vehicle_status',
             self.vehicle_status_callback,
             qos_profile)
+        self.publisher_vehicle_command = self.create_publisher(VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
         self.publisher_offboard_mode = self.create_publisher(OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
         self.publisher_trajectory = self.create_publisher(TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
         timer_period = 0.02  # seconds
         self.timer = self.create_timer(timer_period, self.cmdloop_callback)
         self.dt = timer_period
-        self.declare_parameter('radius', 10.0)
-        self.declare_parameter('omega', 5.0)
+        self.declare_parameter('radius', 2.0)
+        self.declare_parameter('omega', 0.2)
         self.declare_parameter('altitude', 5.0)
         self.nav_state = VehicleStatus.NAVIGATION_STATE_MAX
         self.arming_state = VehicleStatus.ARMING_STATE_DISARMED
@@ -78,7 +82,19 @@ class OffboardControl(Node):
         self.radius = self.get_parameter('radius').value
         self.omega = self.get_parameter('omega').value
         self.altitude = self.get_parameter('altitude').value
- 
+
+        # State machine states
+        self.state = 'TAKEOFF'
+        self.counter = 0
+
+        # Parameters for the movements
+        self.altitude = 5.0  # Altitude for takeoff
+        self.distance = 1.0  # Distance to move in each direction
+        self.position = [0.0, 0.0, 0.0]  # Initial position
+        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
+        time.sleep(1)
+        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0, 0.0)
+
     def vehicle_status_callback(self, msg):
         # TODO: handle NED->ENU transformation
         print("NAV_STATUS: ", msg.nav_state)
@@ -86,24 +102,104 @@ class OffboardControl(Node):
         self.nav_state = msg.nav_state
         self.arming_state = msg.arming_state
 
+    def publish_vehicle_command(self, command, param1, param2):
+        msg = VehicleCommand()
+        msg.param1 = param1
+        msg.param2 = param2
+        msg.command = command
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        self.publisher_vehicle_command.publish(msg)
+
     def cmdloop_callback(self):
         # Publish offboard control modes
         offboard_msg = OffboardControlMode()
-        offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-        offboard_msg.position=True
-        offboard_msg.velocity=False
-        offboard_msg.acceleration=False
+        offboard_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        offboard_msg.position = True
+        offboard_msg.velocity = False
+        offboard_msg.acceleration = False
         self.publisher_offboard_mode.publish(offboard_msg)
         if (self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD and self.arming_state == VehicleStatus.ARMING_STATE_ARMED):
+            self.move_linear()
 
-            trajectory_msg = TrajectorySetpoint()
-            trajectory_msg.position[0] = self.radius * np.cos(self.theta)
-            trajectory_msg.position[1] = self.radius * np.sin(self.theta)
+    def move_linear(self):
+        trajectory_msg = TrajectorySetpoint()
+        trajectory_msg.position = [0.0, 0.0, 0.0]
+        trajectory_msg.velocity = [0.0, 0.0, 0.0]
+        trajectory_msg.acceleration = [0.0, 0.0, 0.0]
+        trajectory_msg.yaw = 3.14/2
+        trajectory_msg.yawspeed = 0.0
+        if self.state == 'TAKEOFF':
             trajectory_msg.position[2] = -self.altitude
-            self.publisher_trajectory.publish(trajectory_msg)
+            self.counter += 1
+            if self.counter >= 500:
+                self.state = 'MOVE_BACKWARD'
+                self.counter = 0
 
-            self.theta = self.theta + self.omega * self.dt
+        elif self.state == 'MOVE_BACKWARD':
+            trajectory_msg.position[2] = -self.altitude
+            trajectory_msg.position[1] = -self.distance
+            self.counter += 1
+            if self.counter >= 250:
+                self.state = 'RETURN_START'
+                self.counter = 0
 
+        elif self.state == 'RETURN_START':
+            trajectory_msg.position[2] = -self.altitude
+            trajectory_msg.position[1] = 0.0
+            self.counter += 1
+            if self.counter >= 250:
+                self.state = 'MOVE_RIGHT'
+                self.counter = 0
+
+        elif self.state == 'MOVE_RIGHT':
+            trajectory_msg.position[2] = -self.altitude
+            trajectory_msg.position[0] = self.distance
+            self.counter += 1
+            if self.counter >= 250:
+                self.state = 'MOVE_LEFT'
+                self.counter = 0
+
+        elif self.state == 'MOVE_LEFT':
+            trajectory_msg.position[2] = -self.altitude
+            trajectory_msg.position[0] = -self.distance
+            self.counter += 1
+            if self.counter >= 250:
+                self.state = 'RETURN_0'
+                self.counter = 0
+
+        elif self.state == 'RETURN_0':
+            trajectory_msg.position[2] = -self.altitude
+            trajectory_msg.position[1] = 0.0
+            self.counter += 1
+            if self.counter >= 250:
+                self.state = 'MOVE_UP'
+                self.counter = 0
+
+        elif self.state == 'MOVE_UP':
+            trajectory_msg.position[2] = -(self.altitude + self.distance)
+            self.counter += 1
+            if self.counter >= 250:
+                self.state = 'MOVE_DOWN'
+                self.counter = 0
+
+        elif self.state == 'MOVE_DOWN':
+            trajectory_msg.position[2] = -self.altitude
+            self.counter += 1
+            if self.counter >= 250:
+                self.state = 'LAND'
+                self.counter = 0
+
+        elif self.state == 'LAND':
+            # self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND, 0.0, 0.0)
+            trajectory_msg.position = [self.radius * np.cos(self.theta), self.radius * np.sin(self.theta), -self.altitude]
+            self.theta += self.omega * self.dt
+
+        self.publisher_trajectory.publish(trajectory_msg)
 
 def main(args=None):
     rclpy.init(args=args)
